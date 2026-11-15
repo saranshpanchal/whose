@@ -53,6 +53,9 @@ pub enum Cmd {
         /// Only processes whose name or command line contains this text.
         #[arg(long = "proc")]
         process: Option<String>,
+        /// Also show accepted sockets on a port this process is listening on.
+        #[arg(long)]
+        inbound: bool,
     },
     /// Free a listener: SIGTERM its process group, then SIGKILL after the grace period.
     #[command(alias = "free")]
@@ -68,6 +71,12 @@ pub enum Cmd {
         /// Milliseconds to wait after SIGTERM before SIGKILL.
         #[arg(long, default_value_t = 2000)]
         grace_ms: u64,
+        /// Show the pids that would be signaled and do not signal them.
+        #[arg(long)]
+        dry_run: bool,
+        /// Signal the listener and its descendants. This is the default scope.
+        #[arg(long, default_value_t = true)]
+        tree: bool,
     },
     /// Live dashboard. `tui` is an alias.
     #[command(alias = "tui")]
@@ -104,8 +113,19 @@ pub fn run() -> Result<i32> {
             None => emit_list(&opts, cli.json, color),
         },
         Some(Cmd::Ls) => emit_list(&opts, cli.json, color),
-        Some(Cmd::Outbound { pid, process }) => {
-            let report = outbound_report(&OutboundFilter { pid, process }, &opts)?;
+        Some(Cmd::Outbound {
+            pid,
+            process,
+            inbound,
+        }) => {
+            let report = outbound_report(
+                &OutboundFilter {
+                    pid,
+                    process,
+                    include_inbound: inbound,
+                },
+                &opts,
+            )?;
             if cli.json {
                 emit_json(&report)?;
             } else {
@@ -118,6 +138,8 @@ pub fn run() -> Result<i32> {
             yes,
             force,
             grace_ms,
+            dry_run,
+            tree,
         }) => {
             let spec = parse_port_spec(&port)?;
             let report = free_port(
@@ -126,7 +148,10 @@ pub fn run() -> Result<i32> {
                     yes,
                     force,
                     grace_ms,
-                    interactive: !cli.json && io::stdin().is_terminal(),
+                    interactive: !cli.json && io::stdin().is_terminal() && !dry_run,
+                    dry_run,
+                    require_yes: false,
+                    tree,
                 },
             )?;
             if cli.json {
@@ -134,7 +159,7 @@ pub fn run() -> Result<i32> {
             } else {
                 emit(&render::free(&report, color))?;
             }
-            Ok(if report.freed { 0 } else { 1 })
+            Ok(if report.dry_run || report.freed { 0 } else { 1 })
         }
         Some(Cmd::Watch) => tui::run(),
         Some(Cmd::Serve { port }) => {
@@ -201,10 +226,14 @@ mod tests {
                 yes,
                 grace_ms,
                 force,
+                dry_run,
+                tree,
             }) => {
                 assert_eq!(port, ":3000");
                 assert!(yes);
                 assert!(!force);
+                assert!(!dry_run);
+                assert!(tree);
                 assert_eq!(grace_ms, 500);
             }
             other => panic!("unexpected {other:?}"),
@@ -219,9 +248,14 @@ mod tests {
         let cli =
             Cli::try_parse_from(["whose", "outbound", "--pid", "42", "--proc", "node"]).unwrap();
         match cli.command {
-            Some(Cmd::Outbound { pid, process }) => {
+            Some(Cmd::Outbound {
+                pid,
+                process,
+                inbound,
+            }) => {
                 assert_eq!(pid, Some(42));
                 assert_eq!(process.as_deref(), Some("node"));
+                assert!(!inbound);
             }
             other => panic!("unexpected {other:?}"),
         }

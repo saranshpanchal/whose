@@ -30,6 +30,7 @@ fn established_socket_exposes_tcp_info() {
     let filter = OutboundFilter {
         pid: Some(std::process::id()),
         process: None,
+        include_inbound: false,
     };
     let mut saw = false;
     let mut detail = String::new();
@@ -60,6 +61,29 @@ fn established_socket_exposes_tcp_info() {
         saw,
         "expected ESTABLISHED tcp_info with bytes on :{port}, last {detail}"
     );
+    let report = outbound_report(&filter, &opts).unwrap();
+    let accepted = report
+        .groups
+        .iter()
+        .flat_map(|group| &group.sockets)
+        .any(|flow| flow.local.ends_with(&format!(":{port}")) && flow.state == "ESTABLISHED");
+    assert!(
+        !accepted,
+        "accepted socket on the listen port should be omitted by default"
+    );
+    let mut with_inbound = filter.clone();
+    with_inbound.include_inbound = true;
+    let report = outbound_report(&with_inbound, &opts).unwrap();
+    let accepted = report
+        .groups
+        .iter()
+        .flat_map(|group| &group.sockets)
+        .any(|flow| {
+            flow.local.ends_with(&format!(":{port}"))
+                && flow.state == "ESTABLISHED"
+                && flow.direction == "inbound"
+        });
+    assert!(accepted, "include_inbound should show the accepted socket");
     drop(client);
     let _ = server.join();
 }

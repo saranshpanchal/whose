@@ -1,34 +1,67 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap, HashSet};
+use std::fs;
 
 use crate::model::{
-    is_listener, is_outbound_state, is_wildcard_ip, FlowReport, OutboundFilter, OutboundGroup,
-    OwnerReport, SockState, SocketRec, TcpInfoOut,
+    is_listener, is_outbound_state, is_wildcard_ip, unknown_owner_group, FlowReport,
+    OutboundFilter, OutboundGroup, OwnerReport, SockState, SocketRec, TcpInfoOut,
 };
 
 /// Close-wait sockets at or above this count are reported as a leak warning.
 pub const CLOSE_WAIT_FLAG: usize = 5;
 
+pub struct ListenIndex {
+    pub by_pid: HashMap<u32, HashSet<u16>>,
+    pub any: HashSet<u16>,
+    pub ephemeral: (u16, u16),
+}
+
+impl ListenIndex {
+    pub fn from_sockets(sockets: &[SocketRec]) -> Self {
+        let mut by_pid: HashMap<u32, HashSet<u16>> = HashMap::new();
+        let mut any = HashSet::new();
+        for sock in sockets {
+            if !is_listener(sock) {
+                continue;
+            }
+            any.insert(sock.local_port);
+            for pid in &sock.pids {
+                by_pid.entry(*pid).or_default().insert(sock.local_port);
+            }
+        }
+        Self {
+            by_pid,
+            any,
+            ephemeral: ephemeral_range(),
+        }
+    }
+}
+
 pub fn assemble(
     sockets: &[SocketRec],
     owners: &BTreeMap<u32, OwnerReport>,
     filter: &OutboundFilter,
+    listens: &ListenIndex,
 ) -> OutboundGroupSet {
     let mut groups: BTreeMap<String, OutboundGroup> = BTreeMap::new();
     for sock in sockets {
         if !is_outbound_state(sock.state) {
             continue;
         }
+        let inbound = is_inbound(sock, listens);
+        if inbound && !filter.include_inbound {
+            continue;
+        }
         if !socket_matches(sock, owners, filter) {
             continue;
         }
-        let flow = flow_report(sock);
+        let flow = flow_report(sock, inbound);
         if sock.pids.is_empty() {
-            let key = format!("uid:{}", sock.uid);
-            let group = groups.entry(key).or_insert_with(|| OutboundGroup {
+            let key = unknown_owner_group(sock.uid);
+            let group = groups.entry(key.clone()).or_insert_with(|| OutboundGroup {
                 pid: None,
                 uid: sock.uid,
                 comm: String::new(),
-                cmdline: format!("uid {}", sock.uid),
+                cmdline: key,
                 repo: None,
                 worktree: None,
                 branch: None,
@@ -128,11 +161,50 @@ fn group_from_owner(pid: u32, uid: u32, owner: Option<&OwnerReport>) -> Outbound
     }
 }
 
-fn flow_report(sock: &SocketRec) -> FlowReport {
+pub(crate) fn is_inbound(sock: &SocketRec, listens: &ListenIndex) -> bool {
+    if sock.pids.is_empty() {
+        return listens.any.contains(&sock.local_port);
+    }
+    let same_process = sock.pids.iter().any(|pid| {
+        listens
+            .by_pid
+            .get(pid)
+            .is_some_and(|ports| ports.contains(&sock.local_port))
+    });
+    if same_process {
+        return true;
+    }
+    let (start, end) = listens.ephemeral;
+    let ephemeral = sock.local_port >= start && sock.local_port <= end;
+    !ephemeral && listens.any.contains(&sock.local_port)
+}
+
+fn ephemeral_range() -> (u16, u16) {
+    let Ok(text) = fs::read_to_string("/proc/sys/net/ipv4/ip_local_port_range") else {
+        return (32768, 60999);
+    };
+    let mut parts = text.split_whitespace();
+    let start = parts
+        .next()
+        .and_then(|value| value.parse().ok())
+        .unwrap_or(32768);
+    let end = parts
+        .next()
+        .and_then(|value| value.parse().ok())
+        .unwrap_or(60999);
+    (start, end)
+}
+
+fn flow_report(sock: &SocketRec, inbound: bool) -> FlowReport {
     let tcp = sock.tcp.as_ref().map(TcpInfoOut::from);
     FlowReport {
         protocol: sock.protocol.as_str().to_string(),
         state: sock.state.as_str().to_string(),
+        direction: if inbound {
+            "inbound".to_string()
+        } else {
+            "outbound".to_string()
+        },
         local: crate::model::format_addr(sock.local_addr, sock.local_port),
         remote: crate::model::format_addr(sock.remote_addr, sock.remote_port),
         uid: sock.uid,

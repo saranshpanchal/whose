@@ -2,13 +2,13 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::Path;
 use std::time::SystemTime;
 
-use crate::context::{ancestry, classify, filter_env, find_git, SupervisorFacts};
+use crate::context::{ancestry, classify, filter_env, find_git, redact_cmdline, SupervisorFacts};
 use crate::error::Result;
 use crate::model::{
     exposure_of, exposure_warning, format_addr, format_uptime, is_listener, is_outbound_state,
     FlowReport, InspectReport, KillTarget, ListenReport, OutboundFilter, OutboundReport,
     OwnerReport, PortBrief, PortReport, ProcessNode, ProjectGroup, ProjectNode, QueryOpts,
-    SocketRec, TcpInfoOut, Topology, UnmappedListen,
+    SocketRec, TcpInfoOut, Topology, UnmappedListen, UNKNOWN_OWNER,
 };
 use crate::netlink;
 use crate::outbound;
@@ -22,7 +22,6 @@ struct World {
     page_size: u64,
     boot: SystemTime,
     self_cgroup: String,
-    self_uid: u32,
     source: String,
 }
 
@@ -53,7 +52,6 @@ fn load(want_details: impl Fn(&SocketRec) -> bool) -> Result<World> {
             proc::fill_details(proc);
         }
     }
-    let self_uid = unsafe { libc::geteuid() };
     Ok(World {
         sockets,
         procs,
@@ -62,7 +60,6 @@ fn load(want_details: impl Fn(&SocketRec) -> bool) -> Result<World> {
         page_size: snap.page_size,
         boot: snap.boot,
         self_cgroup: snap.self_cgroup,
-        self_uid,
         source,
     })
 }
@@ -105,7 +102,7 @@ pub fn list_listening(opts: &QueryOpts) -> Result<ListenReport> {
 pub fn outbound_report(filter: &OutboundFilter, opts: &QueryOpts) -> Result<OutboundReport> {
     let world = load(|sock| is_outbound_state(sock.state) || is_listener(sock))?;
     let owners = owners_for(&world, opts);
-    let assembled = outbound::assemble(&world.sockets, &owners, filter);
+    let assembled = outbound::assemble(&world.sockets, &owners, filter, &listen_index(&world));
     Ok(OutboundReport {
         socket_source: world.source,
         groups: assembled.groups,
@@ -116,6 +113,7 @@ pub fn outbound_report(filter: &OutboundFilter, opts: &QueryOpts) -> Result<Outb
 pub fn topology(opts: &QueryOpts) -> Result<Topology> {
     let world = load(|sock| is_listener(sock) || is_outbound_state(sock.state))?;
     let owners = owners_for(&world, opts);
+    let listens = listen_index(&world);
     let mut projects: BTreeMap<String, ProjectAccum> = BTreeMap::new();
     for sock in &world.sockets {
         if !is_listener(sock) {
@@ -124,12 +122,17 @@ pub fn topology(opts: &QueryOpts) -> Result<Topology> {
         push_listen(&mut projects, &owners, sock);
     }
     for sock in &world.sockets {
-        if !is_outbound_state(sock.state) {
+        if !is_outbound_state(sock.state) || outbound::is_inbound(sock, &listens) {
             continue;
         }
         push_outbound(&mut projects, &owners, sock);
     }
-    let assembled = outbound::assemble(&world.sockets, &owners, &OutboundFilter::default());
+    let assembled = outbound::assemble(
+        &world.sockets,
+        &owners,
+        &OutboundFilter::default(),
+        &listen_index(&world),
+    );
     let mut project_nodes = Vec::new();
     for (_label, acc) in projects {
         let mut processes: Vec<_> = acc.processes.into_values().collect();
@@ -214,9 +217,9 @@ fn group_listeners(world: &World, opts: &QueryOpts) -> Vec<ProjectGroup> {
         }
         let owners = resolve_owners(world, sock, opts);
         if owners.is_empty() {
-            let report = port_report_with(world, sock, owners);
+            let report = port_report_with(sock, owners);
             buckets
-                .entry("(unknown owner)".to_string())
+                .entry(crate::model::unknown_owner_group(sock.uid))
                 .or_default()
                 .ports
                 .push(report);
@@ -235,7 +238,7 @@ fn group_listeners(world: &World, opts: &QueryOpts) -> Vec<ProjectGroup> {
                     (repo, worktree, branch)
                 })
                 .unwrap_or((None, None, None));
-            let report = port_report_with(world, sock, group_owners);
+            let report = port_report_with(sock, group_owners);
             let bucket = buckets.entry(label).or_default();
             bucket.repo = repo;
             bucket.worktree = worktree;
@@ -282,18 +285,16 @@ fn project_key(owner: &OwnerReport) -> (String, Option<String>, Option<String>, 
 
 fn port_report(world: &World, sock: &SocketRec, opts: &QueryOpts) -> PortReport {
     let owners = resolve_owners(world, sock, opts);
-    port_report_with(world, sock, owners)
+    port_report_with(sock, owners)
 }
 
-fn port_report_with(world: &World, sock: &SocketRec, owners: Vec<OwnerReport>) -> PortReport {
+fn port_report_with(sock: &SocketRec, owners: Vec<OwnerReport>) -> PortReport {
     let local = format_addr(sock.local_addr, sock.local_port);
     let exposure = exposure_of(sock);
     let owner_status = if !owners.is_empty() {
         "known"
-    } else if sock.uid != world.self_uid {
-        "other-uid"
     } else {
-        "unknown"
+        UNKNOWN_OWNER
     };
     PortReport {
         protocol: sock.protocol.as_str().to_string(),
@@ -341,7 +342,7 @@ fn owners_for(world: &World, opts: &QueryOpts) -> BTreeMap<u32, OwnerReport> {
 
 fn owner_report(world: &World, pid: u32, opts: &QueryOpts) -> Option<OwnerReport> {
     let proc = world.procs.get(&pid)?;
-    let cmdline = cmdline_of(proc);
+    let raw_cmdline = cmdline_of(proc);
     let args0 = proc.args.first().cloned().unwrap_or_default();
     let exe = proc.exe.clone().unwrap_or_default();
     let chain = ancestry(&world.procs, pid);
@@ -350,7 +351,7 @@ fn owner_report(world: &World, pid: u32, opts: &QueryOpts) -> Option<OwnerReport
         comm: &proc.comm,
         args0: &args0,
         exe: &exe,
-        cmdline: &cmdline,
+        cmdline: &raw_cmdline,
         cgroup: &proc.cgroup,
         environ: &proc.environ,
         ancestry_comms: &ancestry_comms,
@@ -358,14 +359,21 @@ fn owner_report(world: &World, pid: u32, opts: &QueryOpts) -> Option<OwnerReport
     });
     let git = proc.cwd.as_deref().and_then(|cwd| find_git(Path::new(cwd)));
     let uptime_secs = uptime_of(proc, world);
+    let (cmdline, args) = if opts.show_secrets || proc.args.is_empty() {
+        (raw_cmdline, proc.args.clone())
+    } else {
+        let args = redact_cmdline(&proc.args);
+        (args.join(" "), args)
+    };
+    let uid = proc.uid.unwrap_or(0);
     Some(OwnerReport {
         pid,
-        uid: proc.uid.unwrap_or(0),
+        uid,
         pgid: proc.pgid,
         sid: proc.sid,
         comm: proc.comm.clone(),
         cmdline,
-        args: proc.args.clone(),
+        args,
         exe: proc.exe.clone(),
         cwd: proc.cwd.clone(),
         uptime: format_uptime(uptime_secs),
@@ -448,27 +456,31 @@ fn push_listen(
         tcp: sock.tcp.as_ref().map(TcpInfoOut::from),
     };
     if sock.pids.is_empty() {
+        let label = crate::model::unknown_owner_group(sock.uid);
         let acc = projects
-            .entry("(unknown owner)".to_string())
+            .entry(label.clone())
             .or_insert_with(|| ProjectAccum {
-                label: "(unknown owner)".to_string(),
+                label,
                 repo: None,
                 worktree: None,
                 branch: None,
                 processes: BTreeMap::new(),
             });
-        let node = acc.processes.entry(0).or_insert_with(|| ProcessNode {
-            pid: 0,
-            cmdline: format!("uid {}", sock.uid),
-            ancestry: Vec::new(),
-            uptime: String::new(),
-            rss_bytes: 0,
-            supervisor: None,
-            stop: None,
-            env: Vec::new(),
-            listens: Vec::new(),
-            outbound: Vec::new(),
-        });
+        let node = acc
+            .processes
+            .entry(sock.uid)
+            .or_insert_with(|| ProcessNode {
+                pid: 0,
+                cmdline: crate::model::unknown_owner_group(sock.uid),
+                ancestry: Vec::new(),
+                uptime: String::new(),
+                rss_bytes: 0,
+                supervisor: None,
+                stop: None,
+                env: Vec::new(),
+                listens: Vec::new(),
+                outbound: Vec::new(),
+            });
         node.listens.push(brief);
         return;
     }
@@ -537,11 +549,16 @@ fn process_node(owner: &OwnerReport) -> ProcessNode {
     }
 }
 
+fn listen_index(world: &World) -> outbound::ListenIndex {
+    outbound::ListenIndex::from_sockets(&world.sockets)
+}
+
 fn flow_of(sock: &SocketRec) -> FlowReport {
     let tcp = sock.tcp.as_ref().map(TcpInfoOut::from);
     FlowReport {
         protocol: sock.protocol.as_str().to_string(),
         state: sock.state.as_str().to_string(),
+        direction: "outbound".to_string(),
         local: format_addr(sock.local_addr, sock.local_port),
         remote: format_addr(sock.remote_addr, sock.remote_port),
         uid: sock.uid,

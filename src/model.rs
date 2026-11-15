@@ -261,9 +261,29 @@ impl SocketRec {
 
 pub fn normalize_ip(addr: IpAddr) -> IpAddr {
     match addr {
-        IpAddr::V6(v6) => v6.to_ipv4().map(IpAddr::V4).unwrap_or(IpAddr::V6(v6)),
+        // Only IPv4-mapped addresses (`::ffff:a.b.c.d`) collapse to IPv4.
+        // `::1` is an IPv4-compatible address in the old sense and must stay
+        // `[::1]`, which is loopback. `to_ipv4()` would turn it into `0.0.0.1`.
+        IpAddr::V6(v6) => mapped_ipv4(v6).map(IpAddr::V4).unwrap_or(IpAddr::V6(v6)),
         other => other,
     }
+}
+
+fn mapped_ipv4(addr: Ipv6Addr) -> Option<Ipv4Addr> {
+    let octets = addr.octets();
+    if octets[..10].iter().all(|byte| *byte == 0) && octets[10] == 0xff && octets[11] == 0xff {
+        Some(Ipv4Addr::new(
+            octets[12], octets[13], octets[14], octets[15],
+        ))
+    } else {
+        None
+    }
+}
+
+pub const UNKNOWN_OWNER: &str = "unknown (no /proc access)";
+
+pub fn unknown_owner_group(uid: u32) -> String {
+    format!("{UNKNOWN_OWNER} uid {uid}")
 }
 
 pub fn format_addr(addr: IpAddr, port: u16) -> String {
@@ -328,6 +348,13 @@ pub struct KillOpts {
     pub grace_ms: u64,
     /// When true and stdin is a terminal, prompt before signaling a sensitive daemon.
     pub interactive: bool,
+    /// Print the pids that would be signaled and do not signal them.
+    pub dry_run: bool,
+    /// Do not signal unless `yes` is set. The MCP tool sets this.
+    pub require_yes: bool,
+    /// Signal the listener and its descendants. This is always the scope; the
+    /// flag is accepted so `whose kill --tree` matches the preview.
+    pub tree: bool,
 }
 
 impl Default for KillOpts {
@@ -337,6 +364,9 @@ impl Default for KillOpts {
             force: false,
             grace_ms: 2000,
             interactive: false,
+            dry_run: false,
+            require_yes: false,
+            tree: true,
         }
     }
 }
@@ -345,6 +375,8 @@ impl Default for KillOpts {
 pub struct OutboundFilter {
     pub pid: Option<u32>,
     pub process: Option<String>,
+    /// Include accepted sockets whose local port is one this process is listening on.
+    pub include_inbound: bool,
 }
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
@@ -454,6 +486,8 @@ pub struct ListenReport {
 pub struct FlowReport {
     pub protocol: String,
     pub state: String,
+    /// `outbound` for connections this process opened, `inbound` for accepted ones.
+    pub direction: String,
     pub local: String,
     pub remote: String,
     pub uid: u32,
@@ -559,6 +593,9 @@ pub struct FreeReport {
     pub ports: Vec<u16>,
     pub executed: bool,
     pub freed: bool,
+    pub dry_run: bool,
+    /// Exact pids that were signaled, or that a dry-run would signal.
+    pub pids: Vec<u32>,
     pub actions: Vec<FreeAction>,
     pub message: String,
 }
@@ -673,5 +710,42 @@ mod tests {
         sock.seen_both_families = false;
         sock.v6only = Some(true);
         assert_eq!(exposure_of(&sock), Exposure::Wildcard);
+    }
+
+    #[test]
+    fn ipv6_loopback_is_not_rendered_as_ipv4() {
+        let loopback = IpAddr::V6(Ipv6Addr::LOCALHOST);
+        assert_eq!(format_addr(loopback, 3000), "[::1]:3000");
+        let mut sock = SocketRec::new(
+            Proto::Tcp,
+            Family::V6,
+            SockState::Listen,
+            loopback,
+            3000,
+            IpAddr::V6(Ipv6Addr::UNSPECIFIED),
+            0,
+        );
+        assert_eq!(exposure_of(&sock), Exposure::Loopback);
+        assert!(exposure_warning(exposure_of(&sock), &format_addr(loopback, 3000)).is_none());
+
+        let mapped_loop = IpAddr::V6(Ipv4Addr::LOCALHOST.to_ipv6_mapped());
+        assert_eq!(format_addr(mapped_loop, 80), "127.0.0.1:80");
+        sock.local_addr = mapped_loop;
+        assert_eq!(exposure_of(&sock), Exposure::Loopback);
+
+        let mapped_public = IpAddr::V6(Ipv4Addr::new(1, 2, 3, 4).to_ipv6_mapped());
+        assert_eq!(format_addr(mapped_public, 443), "1.2.3.4:443");
+        sock.local_addr = mapped_public;
+        assert_eq!(exposure_of(&sock), Exposure::Specific);
+
+        assert_eq!(
+            format_addr(IpAddr::V4(Ipv4Addr::LOCALHOST), 9),
+            "127.0.0.1:9"
+        );
+        assert_eq!(
+            unknown_owner_group(1000),
+            "unknown (no /proc access) uid 1000"
+        );
+        assert!(!unknown_owner_group(1000).contains("uid 0"));
     }
 }

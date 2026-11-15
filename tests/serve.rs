@@ -50,8 +50,48 @@ fn dashboard_binds_loopback_and_serves_json() {
         item.port == port && item.local.starts_with("127.0.0.1:") && item.exposure == "loopback"
     }));
 
+    let evil = http_get_raw(
+        port,
+        "GET /api/ports HTTP/1.1\r\nHost: evil.example\r\nConnection: close\r\n\r\n",
+    );
+    assert!(
+        evil.starts_with("HTTP/1.1 403") || evil.contains("403"),
+        "rebinding host should be rejected, got {evil}"
+    );
+    let post = http_get_raw(
+        port,
+        &format!(
+            "POST /api/ports HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nOrigin: http://evil.example\r\nConnection: close\r\nContent-Length: 0\r\n\r\n"
+        ),
+    );
+    assert!(
+        post.contains("403"),
+        "non-GET with a foreign Origin should be rejected, got {post}"
+    );
+    let post_ok = http_get_raw(
+        port,
+        &format!(
+            "POST /api/ports HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nOrigin: http://127.0.0.1:{port}\r\nConnection: close\r\nContent-Length: 0\r\n\r\n"
+        ),
+    );
+    assert!(
+        !post_ok.contains("403"),
+        "loopback Origin should pass the check, got {post_ok}"
+    );
+
     let _ = child.kill();
     let _ = child.wait();
+}
+
+fn http_get_raw(port: u16, request: &str) -> String {
+    let mut stream = TcpStream::connect(("127.0.0.1", port)).unwrap();
+    stream
+        .set_read_timeout(Some(Duration::from_secs(3)))
+        .unwrap();
+    stream.write_all(request.as_bytes()).unwrap();
+    let mut body = String::new();
+    let _ = stream.read_to_string(&mut body);
+    body
 }
 
 fn http_get(port: u16, path: &str) -> String {
@@ -61,7 +101,7 @@ fn http_get(port: u16, path: &str) -> String {
         .unwrap();
     write!(
         stream,
-        "GET {path} HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n"
+        "GET {path} HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nConnection: close\r\n\r\n"
     )
     .unwrap();
     let mut body = String::new();

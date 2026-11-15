@@ -107,3 +107,86 @@ fn stdio_jsonrpc_whose_port_and_list() {
     assert!(body.get("groups").is_some());
     let _keep = listener;
 }
+
+#[test]
+fn free_port_without_yes_does_not_signal() {
+    let script = r#"
+import socket, time
+s = socket.socket()
+s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+s.bind(("127.0.0.1", 0))
+s.listen(8)
+print(s.getsockname()[1], flush=True)
+while True:
+    time.sleep(3600)
+"#;
+    let mut server = Command::new("python3")
+        .arg("-c")
+        .arg(script)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+    let mut reader = BufReader::new(server.stdout.take().unwrap());
+    let mut line = String::new();
+    reader.read_line(&mut line).unwrap();
+    let port: u16 = line.trim().parse().unwrap();
+
+    let mut mcp = Command::new(env!("CARGO_BIN_EXE_whose"))
+        .arg("mcp")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+    let mut stdin = mcp.stdin.take().unwrap();
+    let stdout = mcp.stdout.take().unwrap();
+    let (tx, rx) = mpsc::channel::<String>();
+    thread::spawn(move || {
+        let mut reader = BufReader::new(stdout);
+        loop {
+            let mut line = String::new();
+            match reader.read_line(&mut line) {
+                Ok(0) | Err(_) => break,
+                Ok(_) => {
+                    if tx.send(line).is_err() {
+                        break;
+                    }
+                }
+            }
+        }
+    });
+    writeln!(
+        stdin,
+        r#"{{"jsonrpc":"2.0","id":1,"method":"initialize","params":{{"protocolVersion":"2025-11-25","capabilities":{{}},"clientInfo":{{"name":"test","version":"0"}}}}}}"#
+    )
+    .unwrap();
+    writeln!(
+        stdin,
+        r#"{{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{{"name":"whose_free_port","arguments":{{"port":{port}}}}}}}"#
+    )
+    .unwrap();
+    stdin.flush().unwrap();
+    let _init = rx.recv_timeout(Duration::from_secs(8)).unwrap();
+    let reply = rx.recv_timeout(Duration::from_secs(8)).unwrap();
+    let reply: Value = serde_json::from_str(reply.trim()).unwrap();
+    assert_eq!(reply["result"]["isError"], false);
+    let text = reply["result"]["content"][0]["text"].as_str().unwrap();
+    let body: Value = serde_json::from_str(text).unwrap();
+    assert_eq!(body["executed"], false, "{text}");
+    assert_eq!(body["dry_run"], true, "{text}");
+    assert!(
+        body["message"].as_str().unwrap_or("").contains("yes"),
+        "{text}"
+    );
+    assert!(
+        TcpListener::bind(("127.0.0.1", port)).is_err(),
+        "port was freed without yes"
+    );
+    let _ = server.kill();
+    let _ = server.wait();
+    drop(stdin);
+    let _ = mcp.kill();
+    let _ = mcp.wait();
+}
