@@ -1,7 +1,9 @@
 use std::net::{Ipv4Addr, SocketAddr};
 
-use axum::http::StatusCode;
-use axum::response::Html;
+use axum::body::Body;
+use axum::http::{header, Method, Request, StatusCode};
+use axum::middleware::{self, Next};
+use axum::response::{Html, IntoResponse, Response};
 use axum::routing::get;
 use axum::{Json, Router};
 use tower_http::compression::CompressionLayer;
@@ -30,7 +32,7 @@ pub async fn serve(port: u16) -> Result<()> {
         .local_addr()
         .map_err(|err| Error::new(err.to_string()))?;
     eprintln!("whose dashboard http://{bound}");
-    axum::serve(listener, router())
+    axum::serve(listener, router(bound.port()))
         .with_graceful_shutdown(async {
             let _ = tokio::signal::ctrl_c().await;
         })
@@ -39,15 +41,73 @@ pub async fn serve(port: u16) -> Result<()> {
     Ok(())
 }
 
-pub fn router() -> Router {
+pub fn router(port: u16) -> Router {
     Router::new()
         .route("/", get(index))
         .route("/api/topology", get(api_topology))
         .route("/api/ports", get(api_ports))
         .route("/api/outbound", get(api_outbound))
+        .layer(middleware::from_fn(move |req, next| async move {
+            guard(port, req, next).await
+        }))
         .layer(CompressionLayer::new())
         .layer(TraceLayer::new_for_http())
         .layer(CorsLayer::new())
+}
+
+pub fn host_allowed(host: &str, port: u16) -> bool {
+    let host = host.trim();
+    [
+        format!("127.0.0.1:{port}"),
+        format!("localhost:{port}"),
+        format!("[::1]:{port}"),
+    ]
+    .iter()
+    .any(|expected| host.eq_ignore_ascii_case(expected))
+}
+
+pub fn origin_allowed(origin: &str, port: u16) -> bool {
+    let origin = origin.trim().trim_end_matches('/');
+    [
+        format!("http://127.0.0.1:{port}"),
+        format!("http://localhost:{port}"),
+        format!("http://[::1]:{port}"),
+        format!("https://127.0.0.1:{port}"),
+        format!("https://localhost:{port}"),
+        format!("https://[::1]:{port}"),
+    ]
+    .iter()
+    .any(|expected| origin.eq_ignore_ascii_case(expected))
+}
+
+async fn guard(port: u16, req: Request<Body>, next: Next) -> Response {
+    let host = req
+        .headers()
+        .get(header::HOST)
+        .and_then(|value| value.to_str().ok())
+        .unwrap_or("");
+    if !host_allowed(host, port) {
+        return (
+            StatusCode::FORBIDDEN,
+            "whose: Host is not this loopback listener",
+        )
+            .into_response();
+    }
+    if req.method() != Method::GET && req.method() != Method::HEAD {
+        let origin = req
+            .headers()
+            .get(header::ORIGIN)
+            .and_then(|value| value.to_str().ok())
+            .unwrap_or("");
+        if !origin_allowed(origin, port) {
+            return (
+                StatusCode::FORBIDDEN,
+                "whose: Origin is not this loopback listener",
+            )
+                .into_response();
+        }
+    }
+    next.run(req).await
 }
 
 async fn index() -> Html<&'static str> {
@@ -79,4 +139,23 @@ async fn blocking<T: Send + 'static>(
         .await
         .map_err(|err| (StatusCode::INTERNAL_SERVER_ERROR, err.to_string()))?
         .map_err(|err| (StatusCode::INTERNAL_SERVER_ERROR, err.to_string()))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn host_and_origin_must_be_loopback_with_the_bound_port() {
+        assert!(host_allowed("127.0.0.1:7070", 7070));
+        assert!(host_allowed("localhost:7070", 7070));
+        assert!(host_allowed("[::1]:7070", 7070));
+        assert!(!host_allowed("evil.example:7070", 7070));
+        assert!(!host_allowed("127.0.0.1:80", 7070));
+        assert!(!host_allowed("127.0.0.1", 7070));
+        assert!(origin_allowed("http://127.0.0.1:7070", 7070));
+        assert!(origin_allowed("http://[::1]:7070", 7070));
+        assert!(!origin_allowed("http://evil.example:7070", 7070));
+        assert!(!origin_allowed("", 7070));
+    }
 }

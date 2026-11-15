@@ -3,7 +3,7 @@ mod git;
 
 use std::collections::HashMap;
 
-pub use attrib::{classify, filter_env, is_sensitive_daemon, SupervisorFacts};
+pub use attrib::{classify, filter_env, is_sensitive_daemon, redact_cmdline, SupervisorFacts};
 pub use git::find_git;
 
 use crate::model::{Ancestor, GitInfo, SupervisorInfo};

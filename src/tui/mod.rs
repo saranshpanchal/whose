@@ -179,6 +179,9 @@ fn kill_port(port: u16) -> String {
             force: false,
             grace_ms: 2000,
             interactive: false,
+            dry_run: false,
+            require_yes: false,
+            tree: true,
         },
     ) {
         Ok(report) => report.message,

@@ -46,19 +46,30 @@ pub fn handle_message(text: &str) -> Option<String> {
     let id = value.get("id").cloned().unwrap_or(Value::Null);
     let method = value.get("method").and_then(Value::as_str).unwrap_or("");
     let reply = match method {
-        "initialize" => ok(
+        "initialize" => {
+            let requested = value
+                .pointer("/params/protocolVersion")
+                .and_then(Value::as_str)
+                .unwrap_or(LATEST_LEGACY);
+            ok(
+                id,
+                json!({
+                    "protocolVersion": negotiate_legacy(requested),
+                    "capabilities": { "tools": { "listChanged": false } },
+                    "serverInfo": { "name": "whose", "version": env!("CARGO_PKG_VERSION") },
+                    "instructions": "whose_free_port does not signal unless arguments.yes is true."
+                }),
+            )
+        }
+        "server/discover" => ok(id, discover_result()),
+        "tools/list" => ok(
             id,
             json!({
-                "protocolVersion": value
-                    .pointer("/params/protocolVersion")
-                    .and_then(Value::as_str)
-                    .unwrap_or("2024-11-05"),
-                "capabilities": { "tools": { "listChanged": false } },
-                "serverInfo": { "name": "whose", "version": env!("CARGO_PKG_VERSION") }
+                "tools": tool_defs(),
+                "resultType": "complete"
             }),
         ),
-        "tools/list" => ok(id, json!({ "tools": tool_defs() })),
-        "ping" => ok(id, json!({})),
+        "ping" => ok(id, json!({ "resultType": "complete" })),
         "tools/call" => match call_tool(value.get("params")) {
             Ok(payload) => ok(id, payload),
             Err(err) => ok(
@@ -103,6 +114,10 @@ fn call_tool(params: Option<&Value>) -> std::result::Result<Value, String> {
                     .get("process")
                     .and_then(Value::as_str)
                     .map(str::to_string),
+                include_inbound: args
+                    .get("include_inbound")
+                    .and_then(Value::as_bool)
+                    .unwrap_or(false),
             };
             as_json(outbound_report(&filter, &opts))?
         }
@@ -113,6 +128,12 @@ fn call_tool(params: Option<&Value>) -> std::result::Result<Value, String> {
                 force: args.get("force").and_then(Value::as_bool).unwrap_or(false),
                 grace_ms: args.get("grace_ms").and_then(Value::as_u64).unwrap_or(2000),
                 interactive: false,
+                dry_run: args
+                    .get("dry_run")
+                    .and_then(Value::as_bool)
+                    .unwrap_or(false),
+                require_yes: true,
+                tree: true,
             };
             as_json(free_port(spec, kill))?
         }
@@ -121,7 +142,8 @@ fn call_tool(params: Option<&Value>) -> std::result::Result<Value, String> {
     let text = serde_json::to_string_pretty(&value).map_err(|err| err.to_string())?;
     Ok(json!({
         "content": [{ "type": "text", "text": text }],
-        "isError": false
+        "isError": false,
+        "resultType": "complete"
     }))
 }
 
@@ -143,6 +165,44 @@ fn port_from_args(args: &Value) -> std::result::Result<crate::model::PortSpec, S
         return parse_port_spec(query).map_err(|err| err.to_string());
     }
     Err("missing port".to_string())
+}
+
+const LATEST_LEGACY: &str = "2025-11-25";
+const LATEST_MODERN: &str = "2026-07-28";
+
+fn supported_versions() -> &'static [&'static str] {
+    &[
+        "2024-11-05",
+        "2025-03-26",
+        "2025-06-18",
+        LATEST_LEGACY,
+        LATEST_MODERN,
+    ]
+}
+
+fn negotiate_legacy(requested: &str) -> &'static str {
+    supported_versions()
+        .iter()
+        .copied()
+        .find(|version| *version == requested && *version != LATEST_MODERN)
+        .unwrap_or(LATEST_LEGACY)
+}
+
+fn discover_result() -> Value {
+    json!({
+        "resultType": "complete",
+        "supportedVersions": supported_versions(),
+        "capabilities": { "tools": { "listChanged": false } },
+        "instructions": "whose_free_port does not signal unless arguments.yes is true. Supervised processes also need force.",
+        "ttlMs": 3600000,
+        "cacheScope": "public",
+        "_meta": {
+            "io.modelcontextprotocol/serverInfo": {
+                "name": "whose",
+                "version": env!("CARGO_PKG_VERSION")
+            }
+        }
+    })
 }
 
 fn tool_defs() -> Value {
@@ -181,7 +241,7 @@ fn tool_defs() -> Value {
         },
         {
             "name": "whose_free_port",
-            "description": "Free a listening port by signaling its process group. Does not signal unless yes is true. Supervised processes also need force.",
+            "description": "Free a listening port by signaling the listener and its descendants, never its ancestors. Refuses unless yes is true. Supervised processes also need force. Databases need yes.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -304,5 +364,37 @@ mod tests {
         let text = called["result"]["content"][0]["text"].as_str().unwrap();
         let body: Value = serde_json::from_str(text).unwrap();
         assert!(body.get("groups").is_some());
+    }
+
+    #[test]
+    fn negotiates_a_supported_protocol_version() {
+        let echoed = handle_message(
+            r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2024-11-05"}}"#,
+        )
+        .unwrap();
+        let echoed: Value = serde_json::from_str(&echoed).unwrap();
+        assert_eq!(echoed["result"]["protocolVersion"], "2024-11-05");
+
+        let fallback = handle_message(
+            r#"{"jsonrpc":"2.0","id":2,"method":"initialize","params":{"protocolVersion":"1999-01-01"}}"#,
+        )
+        .unwrap();
+        let fallback: Value = serde_json::from_str(&fallback).unwrap();
+        assert_eq!(fallback["result"]["protocolVersion"], "2025-11-25");
+        assert_ne!(fallback["result"]["protocolVersion"], "1999-01-01");
+
+        let discovered =
+            handle_message(r#"{"jsonrpc":"2.0","id":3,"method":"server/discover"}"#).unwrap();
+        let discovered: Value = serde_json::from_str(&discovered).unwrap();
+        assert_eq!(discovered["result"]["resultType"], "complete");
+        let versions = discovered["result"]["supportedVersions"]
+            .as_array()
+            .unwrap();
+        assert!(versions.iter().any(|v| v == "2026-07-28"));
+        assert!(versions.iter().any(|v| v == "2025-11-25"));
+        assert_eq!(
+            discovered["result"]["_meta"]["io.modelcontextprotocol/serverInfo"]["name"],
+            "whose"
+        );
     }
 }

@@ -16,26 +16,165 @@ pub struct SupervisorFacts<'a> {
 pub fn filter_env(env: &[(String, String)], show_secrets: bool) -> Vec<EnvPair> {
     let mut out = Vec::new();
     for (key, value) in env {
-        if !is_allowlisted(key) {
+        let url = url_has_userinfo(value);
+        if !is_allowlisted(key) && !url {
             continue;
         }
-        let secret = is_secret_key(key);
-        if secret && !show_secrets {
-            out.push(EnvPair {
-                key: key.clone(),
-                value: "<redacted>".to_string(),
-                redacted: true,
-            });
-        } else {
+        if show_secrets {
             out.push(EnvPair {
                 key: key.clone(),
                 value: value.clone(),
                 redacted: false,
             });
+            continue;
         }
+        if is_secret_key(key) {
+            out.push(EnvPair {
+                key: key.clone(),
+                value: "<redacted>".to_string(),
+                redacted: true,
+            });
+            continue;
+        }
+        let shown = redact_url_credentials(value);
+        out.push(EnvPair {
+            key: key.clone(),
+            value: shown.clone(),
+            redacted: shown != *value,
+        });
     }
     out.sort_by(|a, b| a.key.cmp(&b.key));
     out
+}
+
+/// Redact argv the way it is shown in CLI, JSON, MCP, and the dashboard.
+pub fn redact_cmdline(args: &[String]) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut index = 0;
+    while index < args.len() {
+        let arg = &args[index];
+        if let Some((key, value)) = split_env_assign(arg) {
+            if assignment_is_secret(key) {
+                out.push(format!("{key}=<redacted>"));
+            } else if url_has_userinfo(value) {
+                out.push(format!("{key}={}", redact_url_credentials(value)));
+            } else {
+                out.push(arg.clone());
+            }
+            index += 1;
+            continue;
+        }
+        if let Some((flag, value)) = split_flag_value(arg) {
+            if flag_is_secret(flag) {
+                out.push(format!("{flag}=<redacted>"));
+            } else {
+                out.push(format!("{flag}={}", redact_url_credentials(value)));
+            }
+            index += 1;
+            continue;
+        }
+        if flag_is_secret(arg) {
+            out.push(arg.clone());
+            if let Some(next) = args.get(index + 1) {
+                if !next.starts_with('-') {
+                    out.push("<redacted>".to_string());
+                    index += 2;
+                    continue;
+                }
+            }
+            index += 1;
+            continue;
+        }
+        out.push(redact_url_credentials(arg));
+        index += 1;
+    }
+    out
+}
+
+fn assignment_is_secret(key: &str) -> bool {
+    is_secret_key(key) || flag_is_secret(key)
+}
+
+fn split_env_assign(arg: &str) -> Option<(&str, &str)> {
+    if arg.starts_with('-') {
+        return None;
+    }
+    let (key, value) = arg.split_once('=')?;
+    let first = key.chars().next()?;
+    if !first.is_ascii_alphabetic() && first != '_' {
+        return None;
+    }
+    if !key
+        .chars()
+        .all(|ch| ch.is_ascii_alphanumeric() || ch == '_')
+    {
+        return None;
+    }
+    Some((key, value))
+}
+
+fn split_flag_value(arg: &str) -> Option<(&str, &str)> {
+    if !arg.starts_with('-') {
+        return None;
+    }
+    let (flag, value) = arg.split_once('=')?;
+    if flag == "-" {
+        return None;
+    }
+    Some((flag, value))
+}
+
+fn flag_is_secret(flag: &str) -> bool {
+    let name = flag.trim_start_matches('-').to_ascii_lowercase();
+    if name.is_empty() || name == "p" || name == "port" {
+        return false;
+    }
+    const MARKERS: &[&str] = &[
+        "password",
+        "passwd",
+        "secret",
+        "token",
+        "api-key",
+        "apikey",
+        "api_key",
+        "access-key",
+        "access_key",
+        "credential",
+    ];
+    MARKERS
+        .iter()
+        .any(|marker| name == *marker || name.ends_with(marker) || name.contains(marker))
+}
+
+pub fn redact_url_credentials(text: &str) -> String {
+    let mut out = String::new();
+    let mut rest = text;
+    while let Some(scheme) = rest.find("://") {
+        let auth_at = scheme + 3;
+        out.push_str(&rest[..auth_at]);
+        let after = &rest[auth_at..];
+        if let Some(at) = after.find('@') {
+            let userinfo = &after[..at];
+            if !userinfo.contains('/') && userinfo.contains(':') {
+                let (user, _) = userinfo.split_once(':').unwrap_or(("", ""));
+                if user.is_empty() {
+                    out.push_str(":<redacted>@");
+                } else {
+                    out.push_str(user);
+                    out.push_str(":<redacted>@");
+                }
+                rest = &after[at + 1..];
+                continue;
+            }
+        }
+        rest = after;
+    }
+    out.push_str(rest);
+    out
+}
+
+fn url_has_userinfo(text: &str) -> bool {
+    redact_url_credentials(text) != text
 }
 
 fn is_allowlisted(key: &str) -> bool {
@@ -366,6 +505,56 @@ mod tests {
         let raw = serde_json::to_string(&shown).unwrap();
         assert!(raw.contains("super-secret-value"));
         assert!(shown.iter().any(|e| e.key == "DATABASE_URL" && !e.redacted));
+    }
+
+    #[test]
+    fn redacts_url_passwords_and_cmdline_secrets() {
+        let env = vec![
+            (
+                "REDIS_URL".into(),
+                "redis://:super-secret-value@localhost:6379/0".into(),
+            ),
+            (
+                "CACHE_URL".into(),
+                "https://app:super-secret-value@example.com/db".into(),
+            ),
+        ];
+        let filtered = filter_env(&env, false);
+        let blob = serde_json::to_string(&filtered).unwrap();
+        assert!(!blob.contains("super-secret-value"), "{blob}");
+        assert!(blob.contains("REDIS_URL"), "{blob}");
+        assert!(
+            blob.contains("redis://:<redacted>@localhost:6379/0"),
+            "{blob}"
+        );
+        assert!(
+            blob.contains("https://app:<redacted>@example.com/db"),
+            "{blob}"
+        );
+
+        let args = redact_cmdline(&[
+            "node".into(),
+            "server.js".into(),
+            "--api-token=sk-live-secret".into(),
+            "--password".into(),
+            "hunter2".into(),
+            "--port".into(),
+            "3000".into(),
+            "TOKEN=sekret".into(),
+            "https://user:hunter2@example.com/x".into(),
+        ]);
+        let joined = args.join(" ");
+        assert!(!joined.contains("sk-live-secret"), "{joined}");
+        assert!(!joined.contains("hunter2"), "{joined}");
+        assert!(!joined.contains("sekret"), "{joined}");
+        assert!(joined.contains("--api-token=<redacted>"), "{joined}");
+        assert!(joined.contains("--password <redacted>"), "{joined}");
+        assert!(joined.contains("--port 3000"), "{joined}");
+        assert!(joined.contains("TOKEN=<redacted>"), "{joined}");
+        assert!(
+            joined.contains("https://user:<redacted>@example.com/x"),
+            "{joined}"
+        );
     }
 
     #[test]
