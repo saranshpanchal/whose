@@ -1,0 +1,143 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>whose</title>
+<style>
+  :root {
+    color-scheme: dark;
+    --bg: #10141a;
+    --panel: #181e27;
+    --line: #2a3340;
+    --text: #e7edf5;
+    --muted: #8b98a8;
+    --accent: #7ee0c6;
+    --warn: #f0c36a;
+    --bad: #ff7b72;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0;
+    font: 14px/1.45 ui-sans-serif, system-ui, sans-serif;
+    background: var(--bg);
+    color: var(--text);
+  }
+  header {
+    display: flex;
+    gap: 16px;
+    align-items: baseline;
+    padding: 16px 20px;
+    border-bottom: 1px solid var(--line);
+  }
+  h1 { font-size: 18px; margin: 0; letter-spacing: 0.02em; }
+  h1 span { color: var(--accent); }
+  header p { margin: 0; color: var(--muted); }
+  input {
+    margin-left: auto;
+    background: var(--panel);
+    color: var(--text);
+    border: 1px solid var(--line);
+    border-radius: 6px;
+    padding: 6px 10px;
+    min-width: 220px;
+  }
+  main { padding: 16px 20px 40px; display: grid; gap: 14px; }
+  .warn {
+    background: #2a2418;
+    color: var(--warn);
+    border: 1px solid #5a4a28;
+    border-radius: 8px;
+    padding: 8px 12px;
+  }
+  section {
+    background: var(--panel);
+    border: 1px solid var(--line);
+    border-radius: 10px;
+    padding: 12px 14px;
+  }
+  h2 { margin: 0 0 8px; font-size: 15px; }
+  h2 small { color: var(--muted); font-weight: 400; }
+  article { padding: 8px 0; border-top: 1px solid var(--line); }
+  article:first-of-type { border-top: 0; }
+  .cmd { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; }
+  .meta { color: var(--muted); font-size: 12px; }
+  .pills { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 6px; }
+  .pill {
+    font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+    font-size: 12px;
+    border-radius: 999px;
+    padding: 2px 8px;
+    background: #12352e;
+    color: var(--accent);
+  }
+  .pill.warn { background: #3a3018; color: var(--warn); }
+  table { width: 100%; border-collapse: collapse; margin-top: 6px; font-size: 12px; }
+  td { padding: 2px 8px 2px 0; color: var(--muted); font-family: ui-monospace, Menlo, monospace; }
+  td.state { color: var(--text); }
+</style>
+</head>
+<body>
+<header>
+  <h1><span>whose</span> topology</h1>
+  <p id="source">loopback only</p>
+  <input id="q" placeholder="filter worktree, process, port" autocomplete="off">
+</header>
+<main id="view"></main>
+<script>
+const view = document.getElementById("view");
+const source = document.getElementById("source");
+const query = document.getElementById("q");
+let latest = null;
+
+function esc(value) {
+  return String(value ?? "").replace(/[&<>"']/g, (ch) => ({
+    "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;"
+  }[ch]));
+}
+
+function render() {
+  if (!latest) return;
+  const needle = query.value.trim().toLowerCase();
+  const warnings = (latest.warnings || []).map((w) => `<div class="warn">${esc(w)}</div>`).join("");
+  const projects = (latest.projects || []).map((project) => {
+    const processes = (project.processes || []).map((proc) => {
+      const blob = `${project.label} ${proc.cmdline} ${(proc.listens || []).map((p) => p.local).join(" ")}`.toLowerCase();
+      if (needle && !blob.includes(needle)) return "";
+      const pills = (proc.listens || []).map((p) => {
+        const klass = p.exposure === "loopback" ? "pill" : "pill warn";
+        return `<span class="${klass}">${esc(p.protocol)} ${esc(p.local)} ${esc(p.exposure)}</span>`;
+      }).join("");
+      const flows = (proc.outbound || []).slice(0, 8).map((f) =>
+        `<tr><td class="state">${esc(f.state)}</td><td>${esc(f.local)}</td><td>${esc(f.remote)}</td><td>${f.rtt_ms == null ? "" : esc(Number(f.rtt_ms).toFixed(2) + " ms")}</td></tr>`
+      ).join("");
+      const table = flows ? `<table>${flows}</table>` : "";
+      const stop = proc.stop ? `<div class="meta">${esc(proc.stop)}</div>` : "";
+      return `<article>
+        <div class="cmd">pid ${esc(proc.pid)} ${esc(proc.cmdline)}</div>
+        <div class="meta">${esc((proc.ancestry || []).join(" → "))} · up ${esc(proc.uptime)} · rss ${esc(proc.rss_bytes)} B</div>
+        ${stop}
+        <div class="pills">${pills}</div>
+        ${table}
+      </article>`;
+    }).join("");
+    if (!processes.trim()) return "";
+    const sub = [project.repo, project.branch].filter(Boolean).join(" · ");
+    return `<section><h2>${esc(project.label)} <small>${esc(sub)}</small></h2>${processes}</section>`;
+  }).join("");
+  view.innerHTML = warnings + (projects || "<section>no sockets</section>");
+}
+
+async function refresh() {
+  const response = await fetch("/api/topology", { cache: "no-store" });
+  latest = await response.json();
+  source.textContent = `source ${latest.socket_source || "unknown"} · 127.0.0.1 only`;
+  render();
+}
+
+query.addEventListener("input", render);
+refresh();
+setInterval(refresh, 2000);
+</script>
+</body>
+</html>
